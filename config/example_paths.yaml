@@ -1,0 +1,28 @@
+# Copy this file to config/paths.yaml and replace placeholder paths.
+paths:
+  basins_dir: /path/to/Antarctic_discharge_analysis/data/basins
+  racmo_dir: /path/to/Antarctic_discharge_analysis/data/RACMO2pt4p1
+  grace_excel: /path/to/Antarctic_discharge_analysis/data/basins/DataCombo_RignotBasins_update.xlsx
+  discharge_excel: /path/to/Antarctic_discharge_analysis/data/basins/antarctic_discharge_2013-2022_imbie.xlsx
+  gpcp_monthly_dir: /path/to/GPCP_v3_pnt_3_monthly_1983_2024
+  era5_monthly_file: /path/to/era5_tp_198001202412_monthly.nc
+  gpm_root_dir: /path/to/GPM-Constellation-Satellites_MI_and_Sounders
+  uahipa_monthly_file: /path/to/uahipa_precip_monthly_2013_2020.nc
+  cloudsat_dir: /path/to/CloudSat_Antarctica
+  output_dir: outputs/workflow
+  figures_dir: outputs/figures
+  tables_dir: outputs/tables
+
+  # Optional intermediate component tables used by scripts/03_compute_monthly_mass_budget.py
+  monthly_discharge_table: /path/to/monthly_discharge_gt_month.csv
+  monthly_basal_melt_table: /path/to/monthly_basal_melt_gt_month.csv
+  monthly_sublimation_table: /path/to/monthly_sublimation_gt_month.csv
+
+products:
+  pmb: Monthly mass-budget precipitation
+  era5: ERA5 total precipitation
+  gpcp_v3_3: GPCP v3.3 satellite-gauge precipitation
+  gpm_pmw_v07: GPM passive microwave constellation V07
+  gpm_pmw_v08: GPM passive microwave constellation V08
+  uahipa: UA-HIPA precipitation
+  cloudsat: CloudSat Antarctic snowfall climatology
