@@ -1,11 +1,79 @@
-# Antarctic Precipitation PMB Workflow
+# Antarctic Snowfall PMB Benchmark Workflow
 
-This repository contains the Antarctic basin precipitation and
-precipitation-minus-balance/mass-budget workflow used to compare precipitation
-products against a basin-scale PMB estimate.
+This repository contains the workflow for the manuscript:
+
+**Benchmarking Antarctic Snowfall Products With a Basin-Scale Mass-Budget
+Constraint: ERA5, GPCP V3.3, and GPM Passive Microwave Estimates**.
+
+The analysis builds a basin-scale mass-budget precipitation estimate (`PMB`) and
+uses it as an independent benchmark for Antarctic snowfall products during
+2013-2020. The evaluated products are ERA5, GPCP V3.3, and GPM passive
+microwave (`PMW`) Version 7 and Version 8 estimates.
+
+## Study Summary
+
+Accurate Antarctic snowfall estimates are needed for ice-sheet mass balance,
+sea-level change, and high-latitude water-cycle studies, but direct
+precipitation observations over the Antarctic Ice Sheet are sparse. This
+workflow estimates snowfall indirectly from the cryospheric mass budget and then
+compares gridded precipitation products against that basin-scale constraint.
+
+The manuscript reports that ERA5 agrees most closely with PMB over the full
+Antarctic Ice Sheet, with a 2013-2020 mean of about **175 mm/yr** compared with
+**171 mm/yr** for PMB and a basin-scale correlation of **0.96**. GPCP V3.3
+captures the broad accumulation pattern but is moderately drier, with a mean of
+about **159 mm/yr** and basin-scale correlation of **0.85**. GPM PMW V07 strongly
+underestimates Antarctic snowfall, near **25 mm/yr**, while GPM PMW V08 improves
+the constellation mean to about **131 mm/yr**, increases basin-scale correlation
+to **0.98**, and reduces the dry bias from roughly **-84%** to **-28%**.
+
+## Mass-Budget Framework
+
+The workflow estimates basin-scale mass-budget precipitation using:
+
+```text
+P_MB = discharge + basal_melt + deltaS + sublimation
+```
+
+where `deltaS` is the monthly basin storage change from GRACE/GRACE-FO,
+`discharge` is ice export across grounding-line flux gates, `basal_melt` is
+included with lateral mass loss, and `sublimation` is the RACMO2.4p1
+sublimation loss term. Evapotranspiration and runoff are neglected in the
+manuscript because they are generally small over the grounded Antarctic Ice
+Sheet, so Antarctic precipitation is treated as snowfall.
+
+The workflow uses monthly GRACE/altimetry storage anomaly data and computes:
+
+```text
+deltaS_m = S_{m+1} - S_m
+```
+
+with `deltaS_m` assigned to the starting month `m`. Annual discharge and
+basal-melt estimates are distributed uniformly across the months of each
+calendar year so all terms can be evaluated on the monthly PMB time step.
+RACMO2.4p1 `subltot` is converted into a positive sublimation loss term before
+being added to the mass budget.
+
+## Domain And Diagnostics
+
+The analysis uses the Rignot/IMBIE Antarctic drainage-basin framework. The
+source mask contains 19 labeled sectors, including one island sector; this
+workflow focuses on the 18 grounded Antarctic drainage basins, IDs 2-19.
+Regional aggregation is performed for:
+
+- Full Antarctic Ice Sheet (`AIS`)
+- West Antarctica (`WAIS`), with Antarctic Peninsula sectors grouped into WAIS
+- East Antarctica (`EAIS`)
+
+Regional means use cosine-latitude weighting to account for grid-cell area
+variation. Product evaluation is organized around mean annual basin maps,
+regional annual means, seasonal climatologies, annual and seasonal time series,
+basin-scale scatter comparisons, and basin-ranked product spread.
+
+## Repository Layout
 
 The original analysis scripts are preserved at the repository root. The cleaned,
-coauthor-friendly workflow is being organized under:
+coauthor-friendly workflow is organized under:
 
 - `src/antarctic_precip_pmb/`: reusable, import-safe Python modules.
 - `scripts/`: runnable workflow steps.
@@ -14,27 +82,6 @@ coauthor-friendly workflow is being organized under:
 - `data/`: documentation for required external inputs.
 - `outputs/`: documentation for generated outputs.
 - `tests/`: lightweight validation tests.
-
-## Scientific Summary
-
-The workflow estimates basin-scale mass-budget precipitation using:
-
-```text
-P_MB = discharge + basal_melt + deltaS + sublimation
-```
-
-The inspected source scripts use monthly GRACE/altimetry storage anomaly data
-and compute:
-
-```text
-deltaS_m = S_{m+1} - S_m
-```
-
-with `deltaS_m` assigned to the starting month `m`. RACMO2.4p1 sublimation is
-converted into a positive loss term before being added to the mass budget.
-
-The main study period is 2013-2020. Basin IDs 2-19 are used, with West
-Antarctica defined as IDs 10-17 and East Antarctica as IDs 2-9 plus 18-19.
 
 ## Setup
 
@@ -62,9 +109,19 @@ python scripts/06_make_figures_and_tables.py --config config/paths.yaml
 
 Each script supports `--dry-run` for path and action checks.
 
-## Current Caveat
+## Required Data
 
-The manuscript file `Antarctic_Snowfall-PMB-method-V0.docx` was not available
-during this reorganization phase. Method notes in `docs/` are therefore derived
-from the source scripts and should be reconciled with the manuscript before the
-workflow is considered publication-final.
+Large scientific inputs are not committed to this repository. The workflow
+expects local paths to:
+
+- IMBIE/Rignot basin mask, especially `bedmap3_basins_0.1deg.tif`.
+- GRACE/GRACE-FO basin storage-change workbook.
+- Annual discharge and basal-melt workbook.
+- RACMO2.4p1 Antarctic sublimation data.
+- ERA5 monthly precipitation.
+- GPCP V3.3 monthly precipitation.
+- GPM PMW V07 and V08 constellation products.
+- UA-HIPA and CloudSat products used in supporting comparisons.
+
+Generated NetCDF, HDF, GeoTIFF, Excel, pickle, CSV, and figure outputs should
+remain outside Git history.
