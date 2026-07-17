@@ -1,0 +1,20 @@
+name: antarctic-precip-pmb
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.10
+  - numpy
+  - pandas
+  - xarray
+  - netcdf4
+  - h5py
+  - scipy
+  - matplotlib
+  - cartopy
+  - rasterio
+  - rioxarray
+  - pyproj
+  - gdal
+  - openpyxl
+  - pyyaml
+  - pytest

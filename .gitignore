@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local environments
+.env
+.venv/
+venv/
+env/
+
+# Local configs with private paths
+config/paths.yaml
+
+# Large input data and generated outputs
+data/**
+!data/README.md
+outputs/**
+!outputs/README.md
+
+# Scientific data products
+*.nc
+*.nc4
+*.h5
+*.hdf
+*.hdf5
+*.tif
+*.tiff
+*.xlsx
+*.xls
+*.csv
+*.pkl
+*.npy
+*.npz
+
+# Figures and documents generated from analysis
+*.png
+*.jpg
+*.jpeg
+*.pdf
