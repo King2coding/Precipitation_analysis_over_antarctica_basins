@@ -1,9 +1,15 @@
 # Antarctic Snowfall PMB Benchmark Workflow
 
-This repository contains the workflow for the manuscript:
+This repository contains the structured workflow for the submitted manuscript:
 
-**Benchmarking Antarctic Snowfall Products With a Basin-Scale Mass-Budget
-Constraint: ERA5, GPCP V3.3, and GPM Passive Microwave Estimates**.
+**Kumah, K. K., Behrangi, A., Zandi, O., Gardner, A. S., Wiese, D. N., and
+Greene, C. A. (2026). _Quantifying Antarctic Snowfall Accumulation Using the
+Latest Ice Discharge and Spaceborne Gravity Observations: Comparison with
+Reanalysis and Satellite Precipitation Products._ Manuscript submitted.**
+
+The citation and status match the author's public research website as of
+October 2026. Until formal publication, the manuscript status should always be
+stated explicitly.
 
 The analysis builds a basin-scale mass-budget precipitation estimate (`PMB`) and
 uses it as an independent benchmark for Antarctic snowfall products during
@@ -125,3 +131,8 @@ expects local paths to:
 
 Generated NetCDF, HDF, GeoTIFF, Excel, pickle, CSV, and figure outputs should
 remain outside Git history.
+
+## Citation
+
+Machine-readable citation metadata is provided in [`CITATION.cff`](CITATION.cff).
+The manuscript itself is not distributed in this public code repository.

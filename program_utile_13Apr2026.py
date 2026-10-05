@@ -2,6 +2,9 @@
 from program_utils import *
 from Extra_util_functions import *
 import matplotlib.patheffects as pe
+import re
+import glob
+
 #%%
 # Floating Variables
 # -----------------------------------------------------------------------------
@@ -32,6 +35,12 @@ BASIN_NAME_TO_ID = {
     "J-Jpp": 17,
 }
 
+region_name2short = {
+    "Antarctica": "AIS",
+    "West Antarctica": "WAIS",
+    "East Antarctica": "EAIS",
+}
+
 SATELLITE_CATEGORIES = {
     "ATMS": ["SNPP", "NOAA-20"],
     "DMSP-SSMIS": ["F16", "F17", "F18", "F19"],
@@ -55,6 +64,8 @@ product_order_corr = [
     # "AMSR2 (corr.)",   
     "GPM PMW V07 (corr.)",
     "GPM PMW V07",
+    "GPM PMW V08 (corr.)",
+    "GPM PMW V08",
 ]
 #---------------------------------------------------------------------------------
 
@@ -79,6 +90,9 @@ product_styles_corr = {
     "GPM PMW V07": {"color": "cyan", "lw": 3.5},
     "GPM PMW V07 (corr.)": {"color": "cyan", "ls": "--", "lw": 3.5},
 
+    "GPM PMW V08": {"color": "green", "lw": 3.5},
+    "GPM PMW V08 (corr.)": {"color": "green", "ls": "--", "lw": 3.5},
+
     "UA-HIPA": {"color": "magenta", "lw": 2.5},
 }
 #---------------------------------------------------------------------------------
@@ -89,6 +103,7 @@ corr_targets = [
     # "DMSP SSMIS",
     # "AMSR2",
     "GPM PMW V07",
+    "GPM PMW V08",
 ]
 
 product_order = [
@@ -101,6 +116,7 @@ product_order = [
     "DMSP SSMIS",
     "AMSR2",
     "GPM PMW V07",
+    "GPM PMW V08",
 ]
 #---------------------------------------------------------------------------------
 
@@ -114,6 +130,7 @@ product_styles = {
     "DMSP SSMIS": {"lw": 1.5},
     "AMSR2": {"lw": 1.5},
     "GPM PMW V07": {"lw": 1.5},
+    "GPM PMW V08": {"lw": 1.5},
 }
 
 #%%
@@ -767,6 +784,669 @@ def build_gpm_pmw_mean(gpm_family_dict, mean_name="GPM PMW V07"):
     return pmw_mean
 #===============================================================================
 
+# =============================================================================
+# GPM / GPROF V7 PLATFORM-AWARE MONTHLY PROCESSING
+# =============================================================================
+
+def parse_gpm_v7_month_from_filename(file_path):
+    """
+    Extract month-start timestamp from a GPM/GPROF V7 monthly filename.
+
+    The existing preprocess() function in program_utils uses:
+        os.path.basename(file).split('.')[4].split('-')[0]
+
+    This function follows the same logic first, with regex fallback.
+    """
+    fname = os.path.basename(file_path)
+
+    try:
+        date_string = fname.split(".")[4].split("-")[0]
+        return pd.to_datetime(date_string, format="%Y%m%d").to_period("M").to_timestamp()
+    except Exception:
+        pass
+
+    match = re.search(r"\.(\d{8})-S\d{6}-E\d{6}", fname)
+    if match is not None:
+        return pd.to_datetime(match.group(1), format="%Y%m%d").to_period("M").to_timestamp()
+
+    match = re.search(r"(\d{8})", fname)
+    if match is not None:
+        return pd.to_datetime(match.group(1), format="%Y%m%d").to_period("M").to_timestamp()
+
+    raise ValueError(f"Could not parse V7 month from filename: {fname}")
+
+
+def infer_gpm_v7_platform_from_path(file_path, family_name):
+    """
+    Infer platform from the V7 file path.
+
+    This is intentionally path-based rather than filename-only because V7 files
+    are organized under family/Monthly/platform-like folders on your server.
+
+    Examples it should handle:
+        V7/ATMS/Monthly/SNPP/*.nc4
+        V7/ATMS/Monthly/NOAA-20/*.nc4
+        V7/MHS/Monthly/NOAA/NOAA-19/*.nc4
+        V7/MHS/Monthly/METOP/B/*.nc4
+        V7/DMSP-SSMIS/Monthly/F17/*.nc4
+        V7/GCOM-W1_AMSR2/Monthly/*.nc4
+    """
+    parts = list(os.path.normpath(file_path).split(os.sep))
+
+    if "Monthly" not in parts:
+        return "UNKNOWN"
+
+    monthly_index = parts.index("Monthly")
+    after_monthly = parts[monthly_index + 1:-1]
+
+    if len(after_monthly) == 0:
+        if family_name == "AMSR2":
+            return "GCOM-W1"
+        return "UNKNOWN"
+
+    # MHS often has nested folders: NOAA/NOAA-19 or METOP/A
+    if family_name == "MHS":
+        if len(after_monthly) >= 2:
+            return "_".join(after_monthly[:2])
+        return after_monthly[0]
+
+    # ATMS, SSMIS usually use the first folder after Monthly
+    return after_monthly[0]
+
+
+def normalize_gpm_v7_family_name(raw_family):
+    """
+    Standardize V7 family names.
+    """
+    if raw_family == "GCOM-W1_AMSR2":
+        return "AMSR2"
+    return raw_family
+
+
+def clean_gpm_v7_da(da):
+    """
+    Replace common GPM/GPROF V7 missing values with NaN.
+    """
+    da = da.where(np.isfinite(da))
+
+    for fill_value in [-9999.9, -9999.0, -9999, -999.9, -999]:
+        da = da.where(da != fill_value)
+
+    return da
+
+
+def average_duplicate_time_months_safe(da, time_name="time"):
+    """
+    Normalize time to month-start and average duplicate monthly timestamps.
+    """
+    if time_name not in da.dims:
+        raise ValueError(f"DataArray has no {time_name!r} dimension. dims={da.dims}")
+
+    da = da.copy()
+
+    month_times = pd.to_datetime(da[time_name].values).to_period("M").to_timestamp()
+    da = da.assign_coords({time_name: month_times})
+    da = da.sortby(time_name)
+
+    time_index = pd.Index(pd.to_datetime(da[time_name].values))
+
+    if not time_index.has_duplicates:
+        return da
+
+    print("  WARNING: duplicate months found; averaging duplicate months.")
+
+    out = []
+    for t in sorted(time_index.unique()):
+        idx = np.where(time_index == t)[0]
+        tmp = da.isel({time_name: idx})
+
+        if tmp.sizes[time_name] > 1:
+            tmp = tmp.mean(dim=time_name, skipna=True)
+        else:
+            tmp = tmp.isel({time_name: 0}, drop=True)
+
+        tmp = tmp.expand_dims({time_name: [pd.Timestamp(t)]})
+        out.append(tmp)
+
+    da_out = xr.concat(out, dim=time_name)
+    da_out = da_out.sortby(time_name)
+
+    final_index = pd.Index(pd.to_datetime(da_out[time_name].values))
+    if final_index.has_duplicates:
+        raise ValueError("Duplicate months remain after averaging.")
+
+    return da_out
+
+
+def convert_gpm_v7_rate_to_mm_month(da, time_name="time"):
+    """
+    Convert monthly mean precipitation rate to monthly accumulation.
+
+    Use this if surfacePrecipitation is mm/hr.
+    """
+    days_in_month = xr.DataArray(
+        pd.to_datetime(da[time_name].values).days_in_month,
+        dims=[time_name],
+        coords={time_name: da[time_name]},
+    )
+
+    return da * 24.0 * days_in_month
+
+
+def open_one_gpm_v7_monthly_file(
+    file_path,
+    preprocess_func=None,
+    var_name="surfacePrecipitation",
+):
+    """
+    Open one V7 monthly GPROF file and return a 2D DataArray with one time step.
+
+    This does not rely on open_mfdataset. It opens each file separately so that
+    platform-level inventory and time parsing remain explicit and diagnosable.
+    """
+    ds = xr.open_dataset(file_path)
+
+    if preprocess_func is not None:
+        try:
+            ds = preprocess_func(ds)
+        except Exception:
+            # If preprocess fails, fall back to filename parsing below.
+            pass
+
+    if var_name not in ds:
+        raise KeyError(
+            f"{var_name} not found in {file_path}. "
+            f"Available variables: {list(ds.data_vars)}"
+        )
+
+    da = ds[var_name]
+
+    # Drop/handle extra singleton dimensions if present
+    for dim in list(da.dims):
+        if dim not in ["time", "lat", "lon"]:
+            if da.sizes[dim] == 1:
+                da = da.isel({dim: 0}, drop=True)
+
+    if "time" in da.dims:
+        # Some files may already have a time dimension from preprocess.
+        if da.sizes["time"] > 1:
+            raise ValueError(
+                f"Expected one monthly time step in {file_path}, got {da.sizes['time']}"
+            )
+        da = da.isel(time=0, drop=True)
+
+    if {"lon", "lat"}.issubset(set(da.dims)):
+        da = da.transpose("lat", "lon")
+    else:
+        raise ValueError(f"Expected lon/lat dimensions in {file_path}, got {da.dims}")
+
+    file_time = parse_gpm_v7_month_from_filename(file_path)
+    da = da.expand_dims(time=[file_time])
+
+    da = clean_gpm_v7_da(da)
+    da = da.sortby("lon")
+    da = da.sortby("lat", ascending=False)
+
+    return da
+
+
+def collect_gpm_v7_platform_files(gpm_v7_path):
+    """
+    Collect GPM/GPROF V7 monthly files by sensor family and platform.
+
+    Returns
+    -------
+    dict
+        {
+            "ATMS": {
+                "SNPP": [files],
+                "NOAA-20": [files],
+            },
+            "MHS": {
+                "NOAA_NOAA-18": [files],
+                ...
+            },
+            ...
+        }
+    """
+    if not os.path.isdir(gpm_v7_path):
+        raise FileNotFoundError(f"V7 folder not found: {gpm_v7_path}")
+
+    family_platform_files = {}
+
+    for raw_family in sorted(os.listdir(gpm_v7_path)):
+        family_path = os.path.join(gpm_v7_path, raw_family)
+
+        if not os.path.isdir(family_path):
+            continue
+
+        monthly_path = os.path.join(family_path, "Monthly")
+
+        if not os.path.isdir(monthly_path):
+            continue
+
+        family = normalize_gpm_v7_family_name(raw_family)
+
+        files = sorted(
+            glob.glob(os.path.join(monthly_path, "**", "*.nc4"), recursive=True)
+        )
+
+        if len(files) == 0:
+            continue
+
+        family_platform_files.setdefault(family, {})
+
+        for f in files:
+            platform = infer_gpm_v7_platform_from_path(f, family)
+            family_platform_files[family].setdefault(platform, []).append(f)
+
+    for family in family_platform_files:
+        for platform in family_platform_files[family]:
+            family_platform_files[family][platform] = sorted(
+                family_platform_files[family][platform]
+            )
+
+    return family_platform_files
+
+
+def report_gpm_v7_inventory(
+    family_platform_files,
+    start_time="2013-01-01",
+    end_time="2020-12-31",
+):
+    """
+    Print platform-level V7 monthly inventory and missing months.
+    """
+    full_months = pd.date_range(
+        pd.to_datetime(start_time).to_period("M").to_timestamp(),
+        pd.to_datetime(end_time).to_period("M").to_timestamp(),
+        freq="MS",
+    )
+
+    rows = []
+
+    print("\n" + "=" * 90)
+    print("GPM/GPROF V7 PLATFORM-LEVEL INVENTORY")
+    print("=" * 90)
+
+    for family, platform_dict in family_platform_files.items():
+        print(f"\n{family}")
+
+        for platform, files in platform_dict.items():
+            months = []
+            bad_files = []
+
+            for f in files:
+                try:
+                    months.append(parse_gpm_v7_month_from_filename(f))
+                except Exception:
+                    bad_files.append(f)
+
+            month_index = pd.DatetimeIndex(months).sort_values()
+            unique_months = pd.DatetimeIndex(sorted(month_index.unique()))
+
+            in_period = unique_months[
+                (unique_months >= full_months.min()) &
+                (unique_months <= full_months.max())
+            ]
+
+            missing = full_months.difference(in_period)
+            duplicate_count = len(month_index) - len(unique_months)
+
+            first_month = unique_months.min() if len(unique_months) else pd.NaT
+            last_month = unique_months.max() if len(unique_months) else pd.NaT
+
+            print(
+                f"  {platform:16s} "
+                f"files={len(files):4d}, "
+                f"unique_months={len(unique_months):4d}, "
+                f"in_period={len(in_period):3d}/96, "
+                f"first={first_month}, last={last_month}, "
+                f"duplicates={duplicate_count}"
+            )
+
+            if len(missing) > 0:
+                print(f"    Missing within 2013-2020: {list(missing)}")
+
+            if len(bad_files) > 0:
+                print(f"    WARNING: could not parse dates for {len(bad_files)} files")
+
+            rows.append(
+                {
+                    "family": family,
+                    "platform": platform,
+                    "n_files": len(files),
+                    "unique_months_all": len(unique_months),
+                    "months_in_2013_2020": len(in_period),
+                    "first_month": first_month,
+                    "last_month": last_month,
+                    "duplicate_months": duplicate_count,
+                    "missing_months_2013_2020": ";".join(
+                        [m.strftime("%Y-%m") for m in missing]
+                    ),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def prepare_one_gpm_v7_platform_monthly(
+    files,
+    family_name,
+    platform_name,
+    preprocess_func,
+    target_template_01deg,
+    basin_mask_01deg,
+    start_time="2013-01-01",
+    end_time="2020-12-31",
+    convert_rate_to_month=True,
+):
+    """
+    Prepare one V7 platform from one sensor family.
+
+    Example:
+        family_name = ATMS
+        platform_name = SNPP or NOAA-20
+    """
+    print("\n" + "-" * 80)
+    print(f"Preparing V7 platform: {family_name} / {platform_name}")
+    print(f"Number of files: {len(files)}")
+    print("First file:", files[0])
+    print("Last file: ", files[-1])
+    print("-" * 80)
+
+    monthly_arrays = []
+
+    for file_path in sorted(files):
+        try:
+            da_one = open_one_gpm_v7_monthly_file(
+                file_path=file_path,
+                preprocess_func=preprocess_func,
+                var_name="surfacePrecipitation",
+            )
+            monthly_arrays.append(da_one)
+
+        except Exception as exc:
+            print(f"Skipping V7 file due to error: {file_path}")
+            print(f"Reason: {exc}")
+
+    if len(monthly_arrays) == 0:
+        raise ValueError(f"No valid V7 monthly files for {family_name}/{platform_name}")
+
+    da = xr.concat(monthly_arrays, dim="time")
+    da = average_duplicate_time_months_safe(da, time_name="time")
+
+    start_month = pd.to_datetime(start_time).to_period("M").to_timestamp()
+    end_month = pd.to_datetime(end_time).to_period("M").to_timestamp()
+    da = da.sel(time=slice(start_month, end_month))
+
+    if da.sizes.get("time", 0) == 0:
+        raise ValueError(
+            f"{family_name}/{platform_name}: no data after subsetting "
+            f"{start_time} to {end_time}"
+        )
+
+    da = clean_gpm_v7_da(da)
+
+    if convert_rate_to_month:
+        da = convert_gpm_v7_rate_to_mm_month(da, time_name="time")
+
+    da.name = f"{family_name}_{platform_name}_V07_mm_month"
+
+    # Antarctic subset
+    da = subset_antarctica_lat(
+        da,
+        lat_name="lat",
+        north_bound=-55,
+        south_bound=-90,
+    )
+
+    if da.sizes["lat"] == 0 or da.sizes["lon"] == 0:
+        raise ValueError(
+            f"{family_name}/{platform_name}: empty spatial domain after Antarctic subset."
+        )
+
+    da = ensure_1d_latlon_coords(da, lat_name="lat", lon_name="lon")
+
+    da = da.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=False)
+    da = da.rio.write_crs("EPSG:4326", inplace=False)
+
+    print(
+        f"{family_name}/{platform_name} before reprojection: "
+        f"time={da.sizes['time']}, lat={da.sizes['lat']}, lon={da.sizes['lon']}"
+    )
+
+    da_01 = da.rio.reproject_match(
+        target_template_01deg,
+        resampling=Resampling.nearest,
+    )
+
+    rename_map = {}
+    if "x" in da_01.dims:
+        rename_map["x"] = "lon"
+    if "y" in da_01.dims:
+        rename_map["y"] = "lat"
+    if rename_map:
+        da_01 = da_01.rename(rename_map)
+
+    da_01 = da_01.sortby("lon")
+    da_01 = da_01.sortby("lat", ascending=False)
+    da_01 = clean_gpm_v7_da(da_01)
+
+    da_01 = da_01.where(basin_mask_01deg.notnull())
+    da_01 = da_01.where(da_01["lat"] < -60)
+
+    da_01.name = f"{family_name}_{platform_name}_V07_mm_month"
+
+    print(
+        f"{family_name}/{platform_name} after reprojection: "
+        f"time={da_01.sizes['time']}, lat={da_01.sizes['lat']}, lon={da_01.sizes['lon']}"
+    )
+
+    return da_01
+
+
+def make_v7_family_mean_from_platforms(
+    platform_dict,
+    family_name,
+    common_months,
+    min_valid_platforms=1,
+):
+    """
+    Average available V7 platforms within one sensor family.
+
+    Important:
+    - Uses reindex, not nearest.
+    - Missing months remain NaN.
+    - A family month is valid only when at least min_valid_platforms platforms
+      have valid data.
+    """
+    aligned = []
+    platform_names = []
+
+    for platform, da in platform_dict.items():
+        da = average_duplicate_time_months_safe(da, time_name="time")
+        da = da.reindex(time=common_months)
+        aligned.append(da)
+        platform_names.append(platform)
+
+    if len(aligned) == 0:
+        raise ValueError(f"No platforms available for {family_name}")
+
+    stacked = xr.concat(
+        aligned,
+        dim=pd.Index(platform_names, name="platform"),
+        join="exact",
+        compat="override",
+        coords="minimal",
+    )
+
+    valid_platform_count = stacked.notnull().any(dim=("lat", "lon")).sum(dim="platform")
+
+    family_mean = stacked.mean(dim="platform", skipna=True)
+    family_mean = family_mean.where(valid_platform_count >= min_valid_platforms)
+
+    family_mean.name = f"{family_name}_V07_mm_month"
+
+    print(
+        f"\n{family_name} V7 family mean built from platforms: {platform_names}"
+    )
+    print(
+        f"{family_name} V7: valid months in common period = "
+        f"{int(family_mean.notnull().any(dim=('lat', 'lon')).sum().values)} "
+        f"/ {family_mean.sizes['time']}"
+    )
+
+    return family_mean
+
+
+def build_gpm_v7_family_monthly_dict_platform_aware(
+    gpm_v7_path,
+    preprocess_func,
+    target_template_01deg,
+    basin_mask_01deg,
+    start_time="2013-01-01",
+    end_time="2020-12-31",
+    convert_rate_to_month=True,
+    min_valid_platforms_by_family=None,
+    return_platform_dict=False,
+):
+    """
+    Build V7 monthly 0.1° fields by platform first, then average platforms
+    into family-level products.
+
+    This makes V7 behavior consistent with the V8 platform-aware workflow.
+    """
+    if min_valid_platforms_by_family is None:
+        min_valid_platforms_by_family = {}
+
+    common_months = pd.date_range(
+        pd.to_datetime(start_time).to_period("M").to_timestamp(),
+        pd.to_datetime(end_time).to_period("M").to_timestamp(),
+        freq="MS",
+    )
+
+    family_platform_files = collect_gpm_v7_platform_files(gpm_v7_path)
+
+    inventory_df = report_gpm_v7_inventory(
+        family_platform_files,
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+    platform_monthly_dict = {}
+    family_monthly_dict = {}
+
+    for family_name, platform_files in family_platform_files.items():
+        print("\n" + "=" * 90)
+        print(f"STARTING V7 FAMILY: {family_name}")
+        print("=" * 90)
+
+        platform_monthly_dict[family_name] = {}
+
+        for platform_name, files in platform_files.items():
+            try:
+                da_platform = prepare_one_gpm_v7_platform_monthly(
+                    files=files,
+                    family_name=family_name,
+                    platform_name=platform_name,
+                    preprocess_func=preprocess_func,
+                    target_template_01deg=target_template_01deg,
+                    basin_mask_01deg=basin_mask_01deg,
+                    start_time=start_time,
+                    end_time=end_time,
+                    convert_rate_to_month=convert_rate_to_month,
+                )
+
+                platform_monthly_dict[family_name][platform_name] = da_platform
+
+            except Exception as exc:
+                print(f"\nFAILED V7 PLATFORM: {family_name}/{platform_name}")
+                print(f"Error: {exc}")
+                print("Continuing to next platform.")
+
+        if len(platform_monthly_dict[family_name]) == 0:
+            print(f"WARNING: no valid platforms for {family_name}; skipping family.")
+            continue
+
+        min_valid = min_valid_platforms_by_family.get(family_name, 1)
+
+        family_da = make_v7_family_mean_from_platforms(
+            platform_dict=platform_monthly_dict[family_name],
+            family_name=family_name,
+            common_months=common_months,
+            min_valid_platforms=min_valid,
+        )
+
+        if family_name == "DMSP-SSMIS":
+            display_name = "DMSP SSMIS"
+        else:
+            display_name = family_name
+
+        family_monthly_dict[display_name] = family_da
+
+        print(f"SUCCESSFULLY FINISHED V7 FAMILY: {family_name}")
+
+    if return_platform_dict:
+        return family_monthly_dict, platform_monthly_dict, inventory_df
+
+    return family_monthly_dict
+
+
+def build_gpm_pmw_v7_mean_platform_aware(
+    gpm_v7_family_dict,
+    mean_name="GPM PMW V07",
+    common_months=None,
+    min_valid_families=1,
+):
+    """
+    Build the overall GPM/GPROF V7 PMW mean from family-level fields.
+
+    Uses strict monthly alignment and reports valid family count by month.
+    """
+    cleaned_arrays = []
+    family_names = []
+
+    if common_months is None:
+        all_times = []
+        for da in gpm_v7_family_dict.values():
+            all_times.extend(pd.to_datetime(da.time.values).to_list())
+
+        common_months = pd.DatetimeIndex(sorted(pd.Index(all_times).unique()))
+
+    for name, da in gpm_v7_family_dict.items():
+        print(f"Including in V7 PMW mean: {name}, shape={da.shape}")
+
+        if "time" not in da.dims:
+            raise ValueError(f"{name} has no 'time' dimension. dims={da.dims}")
+
+        da = average_duplicate_time_months_safe(da, time_name="time")
+        da = da.reindex(time=common_months)
+
+        cleaned_arrays.append(da)
+        family_names.append(name)
+
+    if len(cleaned_arrays) == 0:
+        raise ValueError("No GPM/GPROF V7 arrays available to average.")
+
+    stacked = xr.concat(
+        cleaned_arrays,
+        dim=pd.Index(family_names, name="pmw_family"),
+        join="exact",
+        compat="override",
+        coords="minimal",
+    )
+
+    valid_family_count = stacked.notnull().any(dim=("lat", "lon")).sum(dim="pmw_family")
+
+    pmw_mean = stacked.mean(dim="pmw_family", skipna=True)
+    pmw_mean = pmw_mean.where(valid_family_count >= min_valid_families)
+    pmw_mean.name = mean_name
+
+    print("\nV7 PMW valid family count by month:")
+    print(valid_family_count.to_series())
+
+    return pmw_mean
 
 def cosine_weighted_mean_masked(da_2d, region_mask, lat_name="lat", lon_name="lon"):
     """
@@ -802,6 +1482,54 @@ def cosine_weighted_mean_masked(da_2d, region_mask, lat_name="lat", lon_name="lo
 
     return num / den
 # =============================================================================
+
+def average_duplicate_time_months_safe(da, time_name="time"):
+    """
+    Safely average duplicate monthly timestamps in a DataArray.
+
+    This avoids xarray groupby(time).mean() issues that can occur when
+    the grouped object no longer exposes 'time' as a normal reducible dimension.
+    """
+    if time_name not in da.dims:
+        raise ValueError(
+            f"Expected '{time_name}' to be a dimension, but got dims={da.dims}"
+        )
+
+    # Normalize all timestamps to month-start
+    time_values = pd.to_datetime(da[time_name].values).to_period("M").to_timestamp()
+    da = da.assign_coords({time_name: time_values})
+
+    # Sort by time
+    da = da.sortby(time_name)
+
+    # If no duplicate months, return directly
+    time_index = pd.Index(da[time_name].values)
+
+    if not time_index.has_duplicates:
+        return da
+
+    print("Duplicate monthly timestamps detected; averaging duplicates safely.")
+
+    unique_times = pd.Index(sorted(time_index.unique()))
+    out = []
+
+    for t in unique_times:
+        idx = np.where(time_index == t)[0]
+
+        tmp = da.isel({time_name: idx})
+
+        if tmp.sizes[time_name] > 1:
+            tmp = tmp.mean(dim=time_name, skipna=True)
+        else:
+            tmp = tmp.isel({time_name: 0}, drop=True)
+
+        tmp = tmp.expand_dims({time_name: [pd.Timestamp(t)]})
+        out.append(tmp)
+
+    da_out = xr.concat(out, dim=time_name)
+    da_out = da_out.sortby(time_name)
+
+    return da_out
 
 # =============================================================================
 
@@ -1653,16 +2381,27 @@ def region_seasonal_dict_to_tidy_df(
 def monthly_to_annual_totals_field(da_monthly, time_name="time"):
     """
     Convert monthly field [mm/month] to annual totals [mm/year].
-    Returns DataArray with dims: year, lat, lon
+
+    Strict behavior:
+    - Missing monthly values remain missing.
+    - Annual totals are only valid where all required monthly values exist.
+    - This avoids accidentally treating missing months as zero.
     """
     da = da_monthly.copy()
-    years = pd.to_datetime(da[time_name].values).year
 
-    annual = (
-        da.assign_coords(year=(time_name, years))
-          .groupby("year")
-          .sum(dim=time_name, skipna=True)
+    # Ensure clean monthly timestamps
+    da = da.assign_coords(
+        {time_name: pd.to_datetime(da[time_name].values).to_period("M").to_timestamp()}
     )
+    da = da.sortby(time_name)
+
+    annual = da.resample({time_name: "YS"}).sum(dim=time_name, skipna=False)
+
+    # Rename time dimension to year for downstream compatibility
+    years = pd.to_datetime(annual[time_name].values).year
+    annual = annual.assign_coords(year=(time_name, years)).swap_dims({time_name: "year"})
+    annual = annual.drop_vars(time_name, errors="ignore")
+
     return annual
 
 
@@ -1851,9 +2590,13 @@ def build_basin_mean_plot_product(
     year_end=2020,
 ):
     """
-    Full pipeline for one product:
-      monthly field -> annual totals -> mean annual field ->
-      basin cosine means -> basin-filled plot grid -> cosine-weighted panel mean
+    Pipeline for one product:
+
+    1. Monthly field -> annual totals
+    2. Annual totals -> 2013-2020 mean annual 2D field
+    3. Compute basin means for the displayed basin-painted map
+    4. Compute panel mean directly from the original mean annual 2D field,
+       not from the basin-painted grid.
     """
     da_annual = monthly_to_annual_totals_field(da_monthly)
     da_annual_mean = annual_to_multiyear_mean_field(da_annual, year_start, year_end)
@@ -1872,11 +2615,14 @@ def build_basin_mean_plot_product(
         value_col="precipitation",
     )
 
-    # THIS is the corrected panel mean
-    panel_mean = basin_panel_mean_cosine_from_plot_grid(
-        basin_plot_grid=plot_grid,
-        basin_mask_2d=basin_mask_2d,
+    # Important:
+    # This is the direct cosine-weighted mean of the product's actual
+    # 2013-2020 mean annual 2D field.
+    panel_mean = cosine_weighted_mean_masked(
+        da_2d=da_annual_mean,
+        region_mask=basin_mask_2d.notnull(),
         lat_name="lat",
+        lon_name="lon",
     )
 
     return {
@@ -1884,8 +2630,733 @@ def build_basin_mean_plot_product(
         "annual_mean_field": da_annual_mean,
         "basin_mean_df": basin_df,
         "plot_grid": plot_grid,
-        "panel_mean": panel_mean,
+        "panel_mean": float(panel_mean.values),
     }
+
+# =============================================================================
+# GPM / GPROF V8 MONTHLY NETCDF PREPROCESSING
+# =============================================================================
+
+def parse_gpm_v8_month_from_filename(file_path):
+    """
+    Extract month-start timestamp from GPM/GPROF V8 monthly filename.
+
+    Example:
+        3A-CLIM-MO.NOAA20.ATMS.GRID2025R1.20171101-S000000-E235959.11.V08A.nc
+    """
+    fname = os.path.basename(file_path)
+    match = re.search(r"\.(\d{8})-S\d{6}-E\d{6}", fname)
+
+    if match is None:
+        raise ValueError(f"Could not parse date from V8 filename: {fname}")
+
+    return pd.to_datetime(match.group(1), format="%Y%m%d").to_period("M").to_timestamp()
+
+
+def parse_gpm_v8_platform_from_filename(file_path):
+    """
+    Extract platform name from GPM/GPROF V8 filename.
+
+    Example:
+        3A-CLIM-MO.NOAA20.ATMS.GRID2025R1.20171101...
+        returns NOAA20
+    """
+    fname = os.path.basename(file_path)
+    parts = fname.split(".")
+
+    if len(parts) < 4:
+        raise ValueError(f"Could not parse platform from filename: {fname}")
+
+    return parts[1]
+
+
+def normalize_gpm_v8_family_name(family):
+    """
+    Standardize folder/family names.
+    """
+    if family == "GCOM-W1_AMSR2":
+        return "AMSR2"
+    return family
+
+
+def clean_gpm_v8_da(da):
+    """
+    Clean common missing/fill values in GPM/GPROF V8 fields.
+    """
+    da = da.where(np.isfinite(da))
+
+    for fill_value in [-9999, -9999.0, -9999.9, -999.9, -999]:
+        da = da.where(da != fill_value)
+
+    return da
+
+
+def open_one_gpm_v8_monthly_file(
+    file_path,
+    var_name="surfacePrecipitation",
+    group="Grid",
+):
+    """
+    Open one monthly GPM/GPROF V8 file and return a 2D DataArray
+    with one time step.
+
+    Assumes the monthly product stores surfacePrecipitation on lon/lat.
+    """
+    ds = xr.open_dataset(file_path, group=group)
+
+    if var_name not in ds:
+        raise KeyError(
+            f"{var_name} not found in {file_path}. "
+            f"Available variables: {list(ds.data_vars)}"
+        )
+
+    da = ds[var_name]
+
+    if "layer" in da.dims:
+        raise ValueError(
+            f"{var_name} in {file_path} unexpectedly has a layer dimension. "
+            "Check whether another variable or layer selection is needed."
+        )
+
+    if {"lon", "lat"}.issubset(set(da.dims)):
+        da = da.transpose("lat", "lon")
+    else:
+        raise ValueError(f"Expected lon/lat dimensions in {file_path}, got {da.dims}")
+
+    file_time = parse_gpm_v8_month_from_filename(file_path)
+    da = da.expand_dims(time=[file_time])
+
+    da = clean_gpm_v8_da(da)
+    da = da.sortby("lon")
+    da = da.sortby("lat", ascending=False)
+
+    return da
+
+
+def average_duplicate_time_months_safe(da, time_name="time"):
+    """
+    Normalize time to month-start and average duplicate monthly timestamps.
+    """
+    if time_name not in da.dims:
+        raise ValueError(f"DataArray has no {time_name!r} dimension. dims={da.dims}")
+
+    da = da.copy()
+
+    month_times = pd.to_datetime(da[time_name].values).to_period("M").to_timestamp()
+    da = da.assign_coords({time_name: month_times})
+    da = da.sortby(time_name)
+
+    time_index = pd.Index(pd.to_datetime(da[time_name].values))
+
+    if not time_index.has_duplicates:
+        return da
+
+    print("  WARNING: duplicate months found; averaging duplicate months.")
+
+    out = []
+    for t in sorted(time_index.unique()):
+        idx = np.where(time_index == t)[0]
+        tmp = da.isel({time_name: idx})
+
+        if tmp.sizes[time_name] > 1:
+            tmp = tmp.mean(dim=time_name, skipna=True)
+        else:
+            tmp = tmp.isel({time_name: 0}, drop=True)
+
+        tmp = tmp.expand_dims({time_name: [pd.Timestamp(t)]})
+        out.append(tmp)
+
+    da_out = xr.concat(out, dim=time_name)
+    da_out = da_out.sortby(time_name)
+
+    final_index = pd.Index(pd.to_datetime(da_out[time_name].values))
+    if final_index.has_duplicates:
+        raise ValueError("Duplicate months remain after averaging.")
+
+    return da_out
+
+
+def convert_gpm_v8_rate_to_mm_month(da, time_name="time"):
+    """
+    Convert monthly mean precipitation rate to monthly accumulation.
+
+    Use this only if surfacePrecipitation is mm/hr.
+    If the file units are already mm/month, set convert_rate_to_month=False.
+    """
+    days_in_month = xr.DataArray(
+        pd.to_datetime(da[time_name].values).days_in_month,
+        dims=[time_name],
+        coords={time_name: da[time_name]},
+    )
+
+    return da * 24.0 * days_in_month
+
+
+def collect_gpm_v8_platform_files(gpm_satellites_path):
+    """
+    Collect GPM/GPROF V8 monthly files by sensor family and platform.
+
+    Returns
+    -------
+    dict
+        Nested dictionary:
+        {
+            "ATMS": {
+                "NOAA20": [files],
+                "NPP": [files],
+            },
+            "MHS": {
+                "NOAA19": [files],
+                ...
+            },
+            ...
+        }
+    """
+    v8_root = os.path.join(gpm_satellites_path, "V8")
+
+    if not os.path.isdir(v8_root):
+        raise FileNotFoundError(f"V8 folder not found: {v8_root}")
+
+    family_platform_files = {}
+
+    for raw_family in sorted(os.listdir(v8_root)):
+        family_path = os.path.join(v8_root, raw_family)
+
+        if not os.path.isdir(family_path):
+            continue
+
+        monthly_path = os.path.join(family_path, "monthly")
+
+        if not os.path.isdir(monthly_path):
+            continue
+
+        family = normalize_gpm_v8_family_name(raw_family)
+
+        files = sorted(
+            glob.glob(os.path.join(monthly_path, "**", "*.nc"), recursive=True)
+        )
+
+        if len(files) == 0:
+            continue
+
+        family_platform_files.setdefault(family, {})
+
+        for f in files:
+            try:
+                platform = parse_gpm_v8_platform_from_filename(f)
+            except Exception:
+                # Fallback to immediate parent folder if filename parsing fails
+                platform = os.path.basename(os.path.dirname(f))
+
+            family_platform_files[family].setdefault(platform, []).append(f)
+
+    for family in family_platform_files:
+        for platform in family_platform_files[family]:
+            family_platform_files[family][platform] = sorted(
+                family_platform_files[family][platform]
+            )
+
+    return family_platform_files
+
+
+def report_gpm_v8_inventory(
+    family_platform_files,
+    start_time="2013-01-01",
+    end_time="2020-12-31",
+):
+    """
+    Print platform-level monthly inventory and missing months.
+    """
+    full_months = pd.date_range(
+        pd.to_datetime(start_time).to_period("M").to_timestamp(),
+        pd.to_datetime(end_time).to_period("M").to_timestamp(),
+        freq="MS",
+    )
+
+    rows = []
+
+    print("\n" + "=" * 90)
+    print("GPM/GPROF V8 PLATFORM-LEVEL INVENTORY")
+    print("=" * 90)
+
+    for family, platform_dict in family_platform_files.items():
+        print(f"\n{family}")
+
+        for platform, files in platform_dict.items():
+            months = []
+            bad_files = []
+
+            for f in files:
+                try:
+                    months.append(parse_gpm_v8_month_from_filename(f))
+                except Exception:
+                    bad_files.append(f)
+
+            month_index = pd.DatetimeIndex(months).sort_values()
+            unique_months = pd.DatetimeIndex(sorted(month_index.unique()))
+
+            in_period = unique_months[
+                (unique_months >= full_months.min()) &
+                (unique_months <= full_months.max())
+            ]
+
+            missing = full_months.difference(in_period)
+            duplicate_count = len(month_index) - len(unique_months)
+
+            first_month = unique_months.min() if len(unique_months) else pd.NaT
+            last_month = unique_months.max() if len(unique_months) else pd.NaT
+
+            print(
+                f"  {platform:12s} "
+                f"files={len(files):4d}, "
+                f"unique_months={len(unique_months):4d}, "
+                f"in_period={len(in_period):3d}/96, "
+                f"first={first_month}, last={last_month}, "
+                f"duplicates={duplicate_count}"
+            )
+
+            if len(missing) > 0:
+                print(f"    Missing within 2013-2020: {list(missing)}")
+
+            if len(bad_files) > 0:
+                print(f"    WARNING: could not parse dates for {len(bad_files)} files")
+
+            rows.append(
+                {
+                    "family": family,
+                    "platform": platform,
+                    "n_files": len(files),
+                    "unique_months_all": len(unique_months),
+                    "months_in_2013_2020": len(in_period),
+                    "first_month": first_month,
+                    "last_month": last_month,
+                    "duplicate_months": duplicate_count,
+                    "missing_months_2013_2020": ";".join(
+                        [m.strftime("%Y-%m") for m in missing]
+                    ),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def prepare_one_gpm_v8_platform_monthly(
+    files,
+    family_name,
+    platform_name,
+    target_template_01deg,
+    basin_mask_01deg,
+    start_time="2013-01-01",
+    end_time="2020-12-31",
+    var_name="surfacePrecipitation",
+    group="Grid",
+    convert_rate_to_month=True,
+):
+    """
+    Prepare one platform from one V8 sensor family.
+
+    Example:
+        family_name = ATMS
+        platform_name = NPP or NOAA20
+    """
+    print("\n" + "-" * 80)
+    print(f"Preparing V8 platform: {family_name} / {platform_name}")
+    print(f"Number of files: {len(files)}")
+    print("First file:", files[0])
+    print("Last file: ", files[-1])
+    print("-" * 80)
+
+    monthly_arrays = []
+
+    for file_path in sorted(files):
+        try:
+            da_one = open_one_gpm_v8_monthly_file(
+                file_path=file_path,
+                var_name=var_name,
+                group=group,
+            )
+            monthly_arrays.append(da_one)
+
+        except Exception as exc:
+            print(f"Skipping file due to error: {file_path}")
+            print(f"Reason: {exc}")
+
+    if len(monthly_arrays) == 0:
+        raise ValueError(f"No valid V8 monthly files for {family_name}/{platform_name}")
+
+    da = xr.concat(monthly_arrays, dim="time")
+    da = average_duplicate_time_months_safe(da, time_name="time")
+
+    # Strict time subset. No nearest matching.
+    start_month = pd.to_datetime(start_time).to_period("M").to_timestamp()
+    end_month = pd.to_datetime(end_time).to_period("M").to_timestamp()
+    da = da.sel(time=slice(start_month, end_month))
+
+    if da.sizes.get("time", 0) == 0:
+        raise ValueError(
+            f"{family_name}/{platform_name}: no data after subsetting "
+            f"{start_time} to {end_time}"
+        )
+
+    da = clean_gpm_v8_da(da)
+
+    if convert_rate_to_month:
+        da = convert_gpm_v8_rate_to_mm_month(da, time_name="time")
+
+    da.name = f"{family_name}_{platform_name}_V08_mm_month"
+
+    # Antarctic subset
+    da = subset_antarctica_lat(
+        da,
+        lat_name="lat",
+        north_bound=-55,
+        south_bound=-90,
+    )
+
+    if da.sizes["lat"] == 0 or da.sizes["lon"] == 0:
+        raise ValueError(
+            f"{family_name}/{platform_name}: empty spatial domain after Antarctic subset."
+        )
+
+    da = ensure_1d_latlon_coords(da, lat_name="lat", lon_name="lon")
+    da = da.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=False)
+    da = da.rio.write_crs("EPSG:4326", inplace=False)
+
+    print(
+        f"{family_name}/{platform_name} before reprojection: "
+        f"time={da.sizes['time']}, lat={da.sizes['lat']}, lon={da.sizes['lon']}"
+    )
+
+    da_01 = da.rio.reproject_match(
+        target_template_01deg,
+        resampling=Resampling.nearest,
+    )
+
+    rename_map = {}
+    if "x" in da_01.dims:
+        rename_map["x"] = "lon"
+    if "y" in da_01.dims:
+        rename_map["y"] = "lat"
+    if rename_map:
+        da_01 = da_01.rename(rename_map)
+
+    da_01 = da_01.sortby("lon")
+    da_01 = da_01.sortby("lat", ascending=False)
+    da_01 = clean_gpm_v8_da(da_01)
+
+    da_01 = da_01.where(basin_mask_01deg.notnull())
+    da_01 = da_01.where(da_01["lat"] < -60)
+
+    da_01.name = f"{family_name}_{platform_name}_V08_mm_month"
+
+    print(
+        f"{family_name}/{platform_name} after reprojection: "
+        f"time={da_01.sizes['time']}, lat={da_01.sizes['lat']}, lon={da_01.sizes['lon']}"
+    )
+
+    return da_01
+
+
+def make_family_mean_from_platforms(
+    platform_dict,
+    family_name,
+    common_months,
+    min_valid_platforms=1,
+):
+    """
+    Average available platforms within one sensor family.
+
+    Important:
+    - Uses reindex, not nearest.
+    - Missing months remain NaN.
+    - A family month is valid only when at least min_valid_platforms platforms
+      have data for that month.
+    """
+    aligned = []
+    platform_names = []
+
+    for platform, da in platform_dict.items():
+        da = average_duplicate_time_months_safe(da, time_name="time")
+        da = da.reindex(time=common_months)
+        aligned.append(da)
+        platform_names.append(platform)
+
+    if len(aligned) == 0:
+        raise ValueError(f"No platforms available for {family_name}")
+
+    stacked = xr.concat(
+        aligned,
+        dim=pd.Index(platform_names, name="platform"),
+        join="exact",
+        compat="override",
+        coords="minimal",
+    )
+
+    valid_platform_count = stacked.notnull().any(dim=("lat", "lon")).sum(dim="platform")
+
+    family_mean = stacked.mean(dim="platform", skipna=True)
+    family_mean = family_mean.where(valid_platform_count >= min_valid_platforms)
+
+    family_mean.name = f"{family_name}_V08_mm_month"
+
+    print(
+        f"\n{family_name} family mean built from platforms: {platform_names}"
+    )
+    print(
+        f"{family_name}: valid months in common period = "
+        f"{int(family_mean.notnull().any(dim=('lat', 'lon')).sum().values)} "
+        f"/ {family_mean.sizes['time']}"
+    )
+
+    return family_mean
+
+
+def build_gpm_v8_family_monthly_dict(
+    gpm_satellites_path,
+    target_template_01deg,
+    basin_mask_01deg,
+    start_time="2013-01-01",
+    end_time="2020-12-31",
+    convert_rate_to_month=True,
+    min_valid_platforms_by_family=None,
+    return_platform_dict=False,
+):
+    """
+    Build monthly 0.1° V8 fields by platform first, then average platforms
+    into family-level products.
+
+    This is designed to handle ATMS correctly:
+    - SNPP/NPP ATMS can cover most/all of 2013-2020.
+    - NOAA-20 ATMS starts later.
+    - The ATMS family mean uses available platforms each month.
+    - Missing months are not filled by nearest-month values.
+    """
+    if min_valid_platforms_by_family is None:
+        min_valid_platforms_by_family = {}
+
+    common_months = pd.date_range(
+        pd.to_datetime(start_time).to_period("M").to_timestamp(),
+        pd.to_datetime(end_time).to_period("M").to_timestamp(),
+        freq="MS",
+    )
+
+    family_platform_files = collect_gpm_v8_platform_files(gpm_satellites_path)
+
+    inventory_df = report_gpm_v8_inventory(
+        family_platform_files,
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+    platform_monthly_dict = {}
+    family_monthly_dict = {}
+
+    for family_name, platform_files in family_platform_files.items():
+        print("\n" + "=" * 90)
+        print(f"STARTING V8 FAMILY: {family_name}")
+        print("=" * 90)
+
+        platform_monthly_dict[family_name] = {}
+
+        for platform_name, files in platform_files.items():
+            try:
+                da_platform = prepare_one_gpm_v8_platform_monthly(
+                    files=files,
+                    family_name=family_name,
+                    platform_name=platform_name,
+                    target_template_01deg=target_template_01deg,
+                    basin_mask_01deg=basin_mask_01deg,
+                    start_time=start_time,
+                    end_time=end_time,
+                    convert_rate_to_month=convert_rate_to_month,
+                )
+
+                platform_monthly_dict[family_name][platform_name] = da_platform
+
+            except Exception as exc:
+                print(f"\nFAILED V8 PLATFORM: {family_name}/{platform_name}")
+                print(f"Error: {exc}")
+                print("Continuing to next platform.")
+
+        if len(platform_monthly_dict[family_name]) == 0:
+            print(f"WARNING: no valid platforms for {family_name}; skipping family.")
+            continue
+
+        min_valid = min_valid_platforms_by_family.get(family_name, 1)
+
+        family_da = make_family_mean_from_platforms(
+            platform_dict=platform_monthly_dict[family_name],
+            family_name=family_name,
+            common_months=common_months,
+            min_valid_platforms=min_valid,
+        )
+
+        if family_name == "DMSP-SSMIS":
+            display_name = "DMSP SSMIS V08"
+        else:
+            display_name = f"{family_name} V08"
+
+        family_monthly_dict[display_name] = family_da
+
+        print(f"SUCCESSFULLY FINISHED V8 FAMILY: {family_name}")
+
+    if return_platform_dict:
+        return family_monthly_dict, platform_monthly_dict, inventory_df
+
+    return family_monthly_dict
+
+
+def build_gpm_pmw_v8_mean(
+    gpm_v8_family_dict,
+    mean_name="GPM PMW V08",
+    common_months=None,
+    min_valid_families=1,
+):
+    """
+    Build the overall GPM/GPROF V8 PMW mean from family-level fields.
+
+    Logic:
+    - Align all family fields to the same monthly time axis.
+    - Stack families.
+    - Compute the gridded family mean at each time/lat/lon pixel.
+    - Require at least min_valid_families valid families per pixel.
+    """
+    cleaned_arrays = []
+    family_names = []
+
+    if common_months is None:
+        all_times = []
+        for da in gpm_v8_family_dict.values():
+            all_times.extend(pd.to_datetime(da.time.values).to_list())
+
+        common_months = pd.DatetimeIndex(sorted(pd.Index(all_times).unique()))
+
+    for name, da in gpm_v8_family_dict.items():
+        print(f"Including in V8 PMW mean: {name}, shape={da.shape}")
+
+        if "time" not in da.dims:
+            raise ValueError(f"{name} has no 'time' dimension. dims={da.dims}")
+
+        da = average_duplicate_time_months_safe(da, time_name="time")
+        da = da.reindex(time=common_months)
+
+        cleaned_arrays.append(da)
+        family_names.append(name)
+
+    if len(cleaned_arrays) == 0:
+        raise ValueError("No GPM/GPROF V8 arrays available to average.")
+
+    stacked = xr.concat(
+        cleaned_arrays,
+        dim=pd.Index(family_names, name="pmw_family"),
+        join="exact",
+        compat="override",
+        coords="minimal",
+    )
+
+    # Pixel-level valid family count
+    valid_family_count = stacked.notnull().sum(dim="pmw_family")
+
+    # Gridded family mean
+    pmw_mean = stacked.mean(dim="pmw_family", skipna=True)
+
+    # Require the requested number of valid families at each pixel
+    pmw_mean = pmw_mean.where(valid_family_count >= min_valid_families)
+    pmw_mean.name = mean_name
+
+    # Reporting only
+    valid_family_count_by_month = stacked.notnull().any(dim=("lat", "lon")).sum(dim="pmw_family")
+
+    print("\nV8 PMW valid family count by month:")
+    print(valid_family_count_by_month.to_series())
+
+    return pmw_mean
+
+def mean_annual_ais_from_monthly(da_monthly, basin_mask_01deg, common_time_main):
+    """
+    Compute 2013-2020 mean annual AIS precipitation from monthly mm/month fields.
+
+    Important:
+    - Uses strict reindexing to the expected 96-month period.
+    - Uses skipna=False for annual sums so incomplete years are not treated
+      as artificially low annual totals.
+    """
+    da_monthly = da_monthly.reindex(time=common_time_main)
+
+    annual = da_monthly.resample(time="YS").sum(skipna=False)
+    mean_annual = annual.mean("time", skipna=True)
+
+    ais_mean = cosine_weighted_mean_masked(
+        mean_annual,
+        basin_mask_01deg.notnull(),
+        lat_name="lat",
+        lon_name="lon",
+    )
+
+    return float(ais_mean.values)
+
+# =============================================================================
+# GPM V8 FAMILY YEARLY AIS COSINE-WEIGHTED TIME SERIES
+# Antarctica only: ATMS, MHS, DMSP-SSMIS, AMSR2, and GPM PMW V08 mean
+# =============================================================================
+
+def annual_ais_cosine_series_from_monthly(
+    da_monthly,
+    basin_mask_01deg,
+    product_name,
+    common_time_main=None,
+    year_start=2013,
+    year_end=2020,
+    lat_name="lat",
+    lon_name="lon",
+):
+    """
+    Convert monthly gridded precipitation [mm/month] to yearly AIS cosine-weighted
+    precipitation totals [mm/year].
+
+    Workflow:
+      monthly 2D fields
+      -> strict monthly alignment
+      -> annual totals
+      -> cosine-weighted AIS mean for each year
+    """
+    da = da_monthly.copy()
+
+    # Normalize time to month start
+    da = da.assign_coords(
+        time=pd.to_datetime(da["time"].values).to_period("M").to_timestamp()
+    )
+    da = da.sortby("time")
+
+    if common_time_main is not None:
+        da = da.reindex(time=common_time_main)
+
+    # Keep only requested years
+    da = da.sel(time=slice(f"{year_start}-01-01", f"{year_end}-12-31"))
+
+    # Strict annual sum: incomplete months remain NaN
+    annual = da.resample(time="YS").sum(skipna=False)
+
+    rows = []
+
+    for t in annual["time"].values:
+        year = pd.to_datetime(t).year
+        field = annual.sel(time=t)
+
+        ais_mean = cosine_weighted_mean_masked(
+            field,
+            basin_mask_01deg.notnull(),
+            lat_name=lat_name,
+            lon_name=lon_name,
+        )
+
+        rows.append({
+            "year": year,
+            "product": product_name,
+            "precipitation": float(ais_mean.values),
+        })
+
+    return pd.DataFrame(rows)
 
 #%% The plots
 # =============================================================================
@@ -2117,6 +3588,9 @@ def plot_seasonal_climatology(
     ylabel="mm/season",
     y_nbins=4,
     legend_ncol=3,
+    panel_labels=("a", "b", "c"),
+    panel_label_xy=(0.02, 0.88),
+    panel_label_fontsize=16,
 ):
     season_labels = ["DJF", "MAM", "JJA", "SON"]
 
@@ -2125,7 +3599,7 @@ def plot_seasonal_climatology(
     if len(region_order) == 1:
         axes = [axes]
 
-    for ax, region in zip(axes, region_order):
+    for i, (ax, region) in enumerate(zip(axes, region_order)):
         sub = clim_df[clim_df["region"] == region]
 
         for prod in product_order:
@@ -2133,10 +3607,15 @@ def plot_seasonal_climatology(
             if ss.empty:
                 continue
 
-            ss["season"] = pd.Categorical(ss["season"], categories=season_labels, ordered=True)
+            ss["season"] = pd.Categorical(
+                ss["season"],
+                categories=season_labels,
+                ordered=True
+            )
             ss = ss.sort_values("season")
 
             style = {} if product_styles is None else product_styles.get(prod, {}).copy()
+
             ax.plot(
                 ss["season"],
                 ss["precipitation"],
@@ -2144,26 +3623,49 @@ def plot_seasonal_climatology(
                 **style
             )
 
-        ax.set_title(region, fontweight="bold", fontsize=18)
+        # Region title
+        ax.set_title(region_name2short[region], fontweight="bold", fontsize=18)
+
+        # Panel label: (a), (b), (c), etc.
+        if panel_labels is not None and i < len(panel_labels):
+            ax.text(
+                panel_label_xy[0],
+                panel_label_xy[1],
+                f"({panel_labels[i]})",
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=panel_label_fontsize,
+                fontweight="bold",
+                bbox=dict(
+                    facecolor="white",
+                    edgecolor="none",
+                    alpha=0.7,
+                    pad=1.5
+                ),
+                zorder=10,
+            )
+
         ax.grid(True, alpha=0.3)
         ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=y_nbins))
 
     fig.supylabel(ylabel, x=0.06, fontweight="bold", fontsize=18)
 
     handles, labels = axes[0].get_legend_handles_labels()
+
     fig.legend(
-        handles, labels,
+        handles,
+        labels,
         loc="lower center",
-        bbox_to_anchor=(0.5, -0.03),
+        bbox_to_anchor=(0.56, -0.03),
         ncol=legend_ncol,
         fontsize=15,
         frameon=False
     )
 
-    # axes[-1].set_xlabel("Season", fontweight="bold")
     plt.tight_layout(rect=[0.05, 0.06, 1, 1])
-    return fig, axes
 
+    return fig, axes
 #-----------------------------------------------------------------------------
 def plot_seasonal_climatology_with_pmb_uncertainty(
     clim_df,
@@ -2321,13 +3823,16 @@ def plot_interannual_variability(
     ylabel="mm/year",
     y_nbins=4,
     legend_ncol=3,
+    panel_labels=("a", "b", "c"),
+    panel_label_xy=(0.02, 0.88),
+    panel_label_fontsize=16,
 ):
     fig, axes = plt.subplots(len(region_order), 1, figsize=figsize, sharex=True)
 
     if len(region_order) == 1:
         axes = [axes]
 
-    for ax, region in zip(axes, region_order):
+    for i, (ax, region) in enumerate(zip(axes, region_order)):
         sub = annual_df[annual_df["region"] == region]
 
         for prod in product_order:
@@ -2336,6 +3841,7 @@ def plot_interannual_variability(
                 continue
 
             style = {} if product_styles is None else product_styles.get(prod, {}).copy()
+
             ax.plot(
                 ss["year"],
                 ss["precipitation"],
@@ -2343,24 +3849,47 @@ def plot_interannual_variability(
                 **style
             )
 
-        ax.set_title(region, fontweight="bold", fontsize=18)
+        ax.set_title(region_name2short[region], fontweight="bold", fontsize=18)
+
+        # Panel label: (a), (b), (c), etc.
+        if panel_labels is not None and i < len(panel_labels):
+            ax.text(
+                panel_label_xy[0],
+                panel_label_xy[1],
+                f"({panel_labels[i]})",
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=panel_label_fontsize,
+                fontweight="bold",
+                bbox=dict(
+                    facecolor="white",
+                    edgecolor="none",
+                    alpha=0.7,
+                    pad=1.5
+                ),
+                zorder=10,
+            )
+
         ax.grid(True, alpha=0.3)
         ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=y_nbins))
 
     fig.supylabel(ylabel, x=0.06, fontweight="bold", fontsize=18)
 
     handles, labels = axes[0].get_legend_handles_labels()
+
     fig.legend(
-        handles, labels,
+        handles,
+        labels,
         loc="lower center",
-        bbox_to_anchor=(0.5, -0.03),
+        bbox_to_anchor=(0.58, -0.03),
         ncol=legend_ncol,
         fontsize=15,
         frameon=False
     )
 
-    # axes[-1].set_xlabel("Year", fontweight="bold")
     plt.tight_layout(rect=[0.05, 0.06, 1, 1])
+
     return fig, axes
 
 
@@ -3171,7 +4700,7 @@ def plot_basin_spread_points_dual(
 
     # spread groups
     if non_gpm_group is None:
-        non_gpm_group = [ref_col, "ERA5", "GPCP V3.3"]
+        non_gpm_group = [ref_col, "ERA5", "GPCP V3.3", "GPM PMW V08"]
 
     if gpm_group is None:
         # keep placeholder structure now; when GPM arrives it will drop in naturally
@@ -3221,7 +4750,7 @@ def plot_basin_spread_points_dual(
     # -------------------------------------------------------------------------
     # points for products
     # -------------------------------------------------------------------------
-    fallback_markers = ["o", "s", "D", "^", "v", "P", "X", "*", "h", ">", "<"]
+    fallback_markers = ["o", "s", "D", "^", "o", "P", "X", "*", "h", ">", "<"]
     fallback_sizes   = [8, 8, 8, 8, 8, 8, 8, 9, 8, 8, 8]
 
     for i, col in enumerate(prod_cols):
@@ -3237,7 +4766,7 @@ def plot_basin_spread_points_dual(
         ms     = st.get("markersize", fallback_sizes[i % len(fallback_sizes)])
 
         # optional hollow ERA5 styling
-        is_hollow = (col == "ERA5")
+        is_hollow = col in ["ERA5", "GPM PMW V08"]#(col == "ERA5")
         mfc = "white" if is_hollow else (color if color is not None else None)
 
         ax.plot(
@@ -3410,7 +4939,277 @@ def plot_basin_spread_points_dual(
 
     return fig, ax, spread_non_gpm, spread_gpm
 
+#-----------------------------------------------------------------------------
+def plot_basin_spread_points_by_region(
+    df,
+    basin_col="basin",
+    ref_col=r"$P_{\mathrm{MB}}$",
+    prod_cols=("ERA5", "GPCP V3.3", "GPM PMW V07", "GPM PMW V08"),
+    product_styles=None,
+    non_gpm_group=None,
+    gpm_group=None,
+    wais_basins=(10, 11, 12, 13, 14, 15, 16, 17),
+    eais_basins=(2, 3, 4, 5, 6, 7, 8, 9, 18, 19),
+    figsize=(13, 7.2),
+    pmb_bar_color="lightgray",
+    pmb_edge_color="black",
+    annotate_fontsize=15,
+    annotate_non_gpm_color="black",
+    annotate_gpm_color="dimgray",
+    legend_ncol=5,
+    place_key=True,
+):
+    """
+    Basin-scale precipitation comparison split into WAIS and EAIS panels.
+    Includes spread annotations:
+      - black: spread(PMB, ERA5, GPCP V3.3, GPM PMW V08)
+      - gray: spread(PMB, GPM PMW V07)
+    """
 
+    if product_styles is None:
+        product_styles = {}
+
+    if non_gpm_group is None:
+        non_gpm_group = [ref_col, "ERA5", "GPCP V3.3", "GPM PMW V08"]
+
+    if gpm_group is None:
+        gpm_group = [ref_col, "GPM PMW V07"]
+
+    if ref_col not in non_gpm_group:
+        non_gpm_group = [ref_col] + list(non_gpm_group)
+
+    if ref_col not in gpm_group:
+        gpm_group = [ref_col] + list(gpm_group)
+
+    def spread_pct_for_group(df_local, cols):
+        arrs = []
+
+        for c in cols:
+            if c in df_local.columns:
+                arrs.append(df_local[c].values.astype(float))
+
+        if len(arrs) < 2:
+            return np.full(len(df_local), np.nan)
+
+        vals = np.vstack(arrs)
+        vmin = np.nanmin(vals, axis=0)
+        vmax = np.nanmax(vals, axis=0)
+        vmean = np.nanmean(vals, axis=0)
+
+        out = np.full_like(vmean, np.nan, dtype=float)
+        ok = np.isfinite(vmin) & np.isfinite(vmax) & np.isfinite(vmean) & (vmean != 0)
+        out[ok] = (vmax[ok] - vmin[ok]) / vmean[ok] * 100.0
+
+        return out
+
+    df_plot = df.copy()
+    df_plot[basin_col] = pd.to_numeric(df_plot[basin_col], errors="coerce")
+    df_plot = df_plot[np.isfinite(df_plot[basin_col])].copy()
+    df_plot[basin_col] = df_plot[basin_col].astype(int)
+    df_plot = df_plot.dropna(subset=[ref_col])
+
+    region_info = [
+        ("West Antarctica", list(wais_basins)),
+        ("East Antarctica", list(eais_basins)),
+    ]
+
+    fig, axes = plt.subplots(
+        nrows=2,
+        ncols=1,
+        figsize=figsize,
+        sharex=False
+    )
+
+    fallback_markers = ["s", "D", "^", "o", "P", "X"]
+    fallback_sizes = [8, 8, 8, 8, 8, 8]
+
+    all_handles, all_labels = [], []
+    spread_outputs = {}
+
+    for ax, (region_name, basin_list) in zip(axes, region_info):
+
+        sub = df_plot[df_plot[basin_col].isin(basin_list)].copy()
+        sub = sub.sort_values(basin_col)
+
+        basins = sub[basin_col].values
+        x = np.arange(len(basins))
+        sub = sub.set_index(basin_col).loc[basins]
+
+        # ---------------------------------------------------------------------
+        # PMB bars
+        # ---------------------------------------------------------------------
+        ax.bar(
+            x,
+            sub[ref_col].values.astype(float),
+            color=pmb_bar_color,
+            edgecolor=pmb_edge_color,
+            linewidth=1.0,
+            label=r"$P_{\mathrm{MB}}$",
+            zorder=1,
+        )
+
+        # ---------------------------------------------------------------------
+        # Product points
+        # ---------------------------------------------------------------------
+        for i, col in enumerate(prod_cols):
+            if col not in sub.columns:
+                continue
+
+            y = sub[col].values.astype(float)
+            mask = np.isfinite(y)
+
+            st = product_styles.get(col, {})
+            color = st.get("color", None)
+            marker = st.get("marker", fallback_markers[i % len(fallback_markers)])
+            ms = st.get("markersize", fallback_sizes[i % len(fallback_sizes)])
+
+            is_hollow = col in ["ERA5", "GPM PMW V08"]
+            mfc = "white" if is_hollow else color
+
+            ax.plot(
+                x[mask],
+                y[mask],
+                linestyle="None",
+                marker=marker,
+                markersize=ms,
+                color=color,
+                markerfacecolor=mfc,
+                markeredgecolor=color,
+                markeredgewidth=1.6,
+                label=col,
+                zorder=4,
+            )
+
+        # ---------------------------------------------------------------------
+        # Spread annotations
+        # ---------------------------------------------------------------------
+        spread_non_gpm = spread_pct_for_group(sub, non_gpm_group)
+        spread_gpm = spread_pct_for_group(sub, gpm_group)
+
+        spread_outputs[region_name] = {
+            "basins": basins,
+            "spread_non_gpm": spread_non_gpm,
+            "spread_gpm": spread_gpm,
+        }
+
+        cols_for_top = sorted(set([ref_col] + list(prod_cols) + list(non_gpm_group) + list(gpm_group)))
+        top_stack = np.vstack([
+            sub[c].values.astype(float)
+            for c in cols_for_top
+            if c in sub.columns
+        ])
+        top_val_all = np.nanmax(top_stack, axis=0)
+
+        # set ylim before annotations
+        ymax = np.nanmax(top_val_all)
+        ax.set_ylim(0, ymax * 1.28)
+
+        y_top_axis = ax.get_ylim()[1]
+
+        for xi, top_val, s_ref in zip(x, top_val_all, spread_non_gpm):
+            if not np.isfinite(top_val): # , s_gpm, spread_gpm
+                continue
+
+            # y1 = min(top_val + 0.13 * y_top_axis, y_top_axis * 0.96)
+            y1 = min(top_val + 0.1 * y_top_axis, y_top_axis * 0.96)
+            y2 = min(top_val + 0.055 * y_top_axis, y_top_axis * 0.88)
+
+            if np.isfinite(s_ref):
+                ax.text(
+                    xi - 0.10,
+                    y1,
+                    f"{int(round(s_ref))}%",
+                    ha="center",
+                    va="bottom",
+                    fontsize=annotate_fontsize,
+                    fontweight="bold",
+                    color=annotate_non_gpm_color,
+                    zorder=9,
+                    path_effects=[pe.withStroke(linewidth=3.5, foreground="white")]
+                )
+
+            # if np.isfinite(s_gpm):
+            #     ax.text(
+            #         xi + 0.10,
+            #         y2,
+            #         f"{int(round(s_gpm))}%",
+            #         ha="center",
+            #         va="bottom",
+            #         fontsize=annotate_fontsize,
+            #         fontweight="bold",
+            #         color=annotate_gpm_color,
+            #         zorder=9,
+            #         path_effects=[pe.withStroke(linewidth=3.5, foreground="white")]
+            #     )
+
+        # ---------------------------------------------------------------------
+        # Cosmetics
+        # ---------------------------------------------------------------------
+        ax.set_title(region_name2short[region_name], fontsize=15, fontweight="bold")
+        ax.set_xticks(x)
+        ax.set_xticklabels(basins, fontsize=14)
+        ax.set_ylabel("[mm/year]", fontsize=14)
+        ax.grid(axis="y", linestyle="--", alpha=0.4, zorder=0)
+
+        handles, labels = ax.get_legend_handles_labels()
+        all_handles.extend(handles)
+        all_labels.extend(labels)
+
+    axes[-1].set_xlabel("Basin", fontsize=15)
+
+    # -------------------------------------------------------------------------
+    # Spread key
+    # -------------------------------------------------------------------------
+    if place_key:
+        axes[0].text(
+            0.01, 0.96,
+            "% = spread($P_{\mathrm{MB}}$, ERA5, GPCP V3.3, GPM PMW V08)",
+            transform=axes[0].transAxes,
+            ha="left",
+            va="top",
+            fontsize=14,
+            color=annotate_non_gpm_color,
+            fontweight="bold",
+        )
+
+        # axes[0].text(
+        #     0.01, 0.88,
+        #     "% = spread($P_{\mathrm{MB}}$, GPM PMW V07)",
+        #     transform=axes[0].transAxes,
+        #     ha="left",
+        #     va="top",
+        #     fontsize=10,
+        #     color=annotate_gpm_color,
+        #     fontweight="bold",
+        # )
+
+    # -------------------------------------------------------------------------
+    # Shared legend
+    # -------------------------------------------------------------------------
+    seen = set()
+    new_handles, new_labels = [], []
+
+    for h, lab in zip(all_handles, all_labels):
+        if lab in seen:
+            continue
+
+        seen.add(lab)
+        new_handles.append(h)
+        new_labels.append(lab)
+
+    fig.legend(
+        new_handles,
+        new_labels,
+        fontsize=14,
+        ncol=legend_ncol,
+        frameon=False,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.01),
+    )
+
+    fig.tight_layout(rect=[0, 0.08, 1, 1])
+
+    return fig, axes, spread_outputs
 # =============================================================================
 # ANNUAL SPATIAL COMPARISON ON COMMON LAT-LON GRID
 # WITH COSINE-WEIGHTED PANEL MEAN
@@ -3741,7 +5540,7 @@ def compare_mean_precip_basin_dual_cbar(
     sm1 = ScalarMappable(norm=norm1, cmap=cmap)
     sm1.set_array([])
 
-    cb1 = fig.colorbar(sm1, cax=cax1, orientation="vertical")
+    cb1 = fig.colorbar(sm1, cax=cax1, orientation="vertical", extend="max")
     if cbar_tcks1 is not None:
         cb1.set_ticks(cbar_tcks1)
     cb1.ax.tick_params(labelsize=11)
@@ -3754,7 +5553,7 @@ def compare_mean_precip_basin_dual_cbar(
     sm2 = ScalarMappable(norm=norm2, cmap=cmap)
     sm2.set_array([])
 
-    cb2 = fig.colorbar(sm2, cax=cax2, orientation="vertical")
+    cb2 = fig.colorbar(sm2, cax=cax2, orientation="vertical", extend="max")
     if cbar_tcks2 is not None:
         cb2.set_ticks(cbar_tcks2)
     cb2.ax.tick_params(labelsize=11)
@@ -3765,39 +5564,424 @@ def compare_mean_precip_basin_dual_cbar(
     return fig, axes, cb1, cb2
 
 #===============================================================================
+def compare_mean_precip_basin_v7_v8_three_row_cbar(
+    arr_lst_mean,
+    basin_mask_latlon,
+    row1_idx=(0, 1, 2),
+    row2_idx=(3, 4, 5, 6, 7),
+    row3_idx=(8, 9, 10, 11, 12),
+    ncols=5,
+    figsize=None,
+    cmap=None,
+    gamma_main=0.6,
+    vmin_main=0,
+    vmax_main=400,
+    cbar_tcks_main=None,
+    cbar_label_main="Rows 1–2: PMB, ERA5, GPCP V3.3, and GPM PMW V8",
+    gamma_v7=0.6,
+    vmin_v7=0,
+    vmax_v7=80,
+    cbar_tcks_v7=None,
+    cbar_label_v7="Row 3: GPM PMW V7",
+    panel_letters=True,
+    show_panel_mean=True,
+    mean_fmt="Mean: {:.0f}",
+    mean_xy=(0.07, 0.93),
+    mean_fontsize=15,
+):
+    """
+    Three-row Antarctic basin precipitation figure.
+
+    Row 1:
+        PMB, ERA5, GPCP V3.3
+
+    Row 2:
+        GPM PMW V8 constellation members and/or mean
+
+    Row 3:
+        GPM PMW V7 constellation members and/or mean
+
+    Rows 1–2 share the main 0–400 mm/year color scale.
+    Row 3 uses a separate low-magnitude color scale for V7.
+    """
+
+    if len(arr_lst_mean) == 0:
+        raise ValueError("arr_lst_mean is empty.")
+
+    row1_idx = list(row1_idx)
+    row2_idx = list(row2_idx)
+    row3_idx = list(row3_idx)
+
+    idx_all = set(range(len(arr_lst_mean)))
+    idx_rows = set(row1_idx).union(row2_idx).union(row3_idx)
+
+    if idx_rows != idx_all:
+        raise ValueError(
+            "row1_idx, row2_idx, and row3_idx must cover all panels exactly. "
+            f"len(arr_lst_mean)={len(arr_lst_mean)}, expected indices={sorted(idx_all)}, "
+            f"provided indices={sorted(idx_rows)}"
+        )
+
+    if (
+        set(row1_idx).intersection(row2_idx)
+        or set(row1_idx).intersection(row3_idx)
+        or set(row2_idx).intersection(row3_idx)
+    ):
+        raise ValueError("row1_idx, row2_idx, and row3_idx must not overlap.")
+
+    proj = ccrs.SouthPolarStereo()
+    cmap = plt.cm.jet if cmap is None else cmap
+
+    norm_main = PowerNorm(gamma=gamma_main, vmin=vmin_main, vmax=vmax_main)
+    norm_v7 = PowerNorm(gamma=gamma_v7, vmin=vmin_v7, vmax=vmax_v7)
+
+    if cbar_tcks_main is None:
+        cbar_tcks_main = [0, 25, 50, 100, 200, 300, 400]
+
+    if cbar_tcks_v7 is None:
+        cbar_tcks_v7 = [0, 5, 10, 20, 40, 60, 80]
+
+    # Fixed 3-row, 5-column layout.
+    nrows = 3
+    ncols = 5
+
+    if figsize is None:
+        figsize = (4.0 * ncols + 1.4, 4.2 * nrows)
+
+    fig, axes2d = plt.subplots(
+        nrows,
+        ncols,
+        subplot_kw={"projection": proj},
+        figsize=figsize
+    )
+
+    fig.subplots_adjust(
+        left=0.035,
+        right=0.865,
+        top=0.96,
+        bottom=0.06,
+        wspace=0.06,
+        hspace=0.18
+    )
+
+    axes2d = np.asarray(axes2d)
+
+    # Hide all axes first.
+    for ax in axes2d.ravel():
+        ax.set_visible(False)
+
+    # Layout positions:
+    # Row 1 has 3 panels centered in columns 1, 2, 3.
+    # Row 2 has 5 panels across all columns.
+    # Row 3 has 5 panels across all columns.
+    layout_positions = {}
+
+    row1_cols = [1, 2, 3]
+    for idx, col in zip(row1_idx, row1_cols):
+        layout_positions[idx] = (0, col)
+
+    for idx, col in zip(row2_idx, range(5)):
+        layout_positions[idx] = (1, col)
+
+    for idx, col in zip(row3_idx, range(5)):
+        layout_positions[idx] = (2, col)
+
+    letters = list("abcdefghijklmnopqrstuvwxyz")
+
+    axes_out = []
+
+    for i, (product_name, plot_grid, panel_mean) in enumerate(arr_lst_mean):
+        r, c = layout_positions[i]
+        ax = axes2d[r, c]
+        ax.set_visible(True)
+
+        panel_label = letters[i] if panel_letters and i < len(letters) else None
+
+        if i in row3_idx:
+            norm = norm_v7
+        else:
+            norm = norm_main
+
+        _plot_single_polar_basin_panel(
+            ax=ax,
+            product_name=product_name,
+            basin_plot_grid=plot_grid,
+            basin_mask_latlon=basin_mask_latlon,
+            panel_mean=panel_mean if show_panel_mean else np.nan,
+            proj=proj,
+            cmap=cmap,
+            norm=norm,
+            panel_label=panel_label,
+            mean_fmt=mean_fmt,
+            mean_xy=mean_xy,
+            mean_fontsize=mean_fontsize,
+        )
+
+        axes_out.append(ax)
+
+    # Main colorbar for rows 1 and 2.
+    cax1 = fig.add_axes([0.89, 0.43, 0.016, 0.42])
+    sm1 = ScalarMappable(norm=norm_main, cmap=cmap)
+    sm1.set_array([])
+
+    cb1 = fig.colorbar(sm1, cax=cax1, orientation="vertical", extend="max")
+    cb1.set_ticks(cbar_tcks_main)
+    cb1.ax.tick_params(labelsize=11)
+    cb1.ax.minorticks_off()
+    cb1.ax.set_title("mm/year", fontsize=12, pad=12)
+    cb1.set_label(cbar_label_main, fontsize=10)
+
+    # Separate V7 colorbar for row 3.
+    cax2 = fig.add_axes([0.89, 0.10, 0.016, 0.22])
+    sm2 = ScalarMappable(norm=norm_v7, cmap=cmap)
+    sm2.set_array([])
+
+    cb2 = fig.colorbar(sm2, cax=cax2, orientation="vertical", extend="max")
+    cb2.set_ticks(cbar_tcks_v7)
+    cb2.ax.tick_params(labelsize=11)
+    cb2.ax.minorticks_off()
+    cb2.ax.set_title("mm/year", fontsize=12, pad=12)
+    cb2.set_label(cbar_label_v7, fontsize=10)
+
+    return fig, axes_out, cb1, cb2
+
+def compare_mean_precip_basin_v7_v8_common_cbar(
+    arr_lst_mean,
+    basin_mask_latlon,
+    row1_idx=(0, 1, 2),
+    row2_idx=(3, 4, 5, 6, 7),
+    row3_idx=(8, 9, 10, 11, 12),
+    ncols=5,
+    figsize=None,
+    cmap=None,
+    gamma=0.6,
+    vmin=0,
+    vmax=400,
+    cbar_ticks=None,
+    cbar_label=r"Mean annual precipitation (mm yr$^{-1}$)",
+    panel_letters=True,
+    show_panel_mean=True,
+    mean_fmt="Mean: {:.0f}",
+    mean_xy=(0.07, 0.93),
+    mean_fontsize=18,
+):
+    """
+    Three-row Antarctic basin precipitation figure with a common color scale.
+
+    Row 1:
+        PMB, ERA5, GPCP v3.3
+
+    Row 2:
+        GPM PMW V08 constellation members and mean
+
+    Row 3:
+        GPM PMW V07 constellation members and mean
+
+    All panels share a common 0-400 mm yr-1 color scale to allow direct
+    visual comparison of V07 and V08 magnitudes.
+    """
+
+    if len(arr_lst_mean) == 0:
+        raise ValueError("arr_lst_mean is empty.")
+
+    row1_idx = list(row1_idx)
+    row2_idx = list(row2_idx)
+    row3_idx = list(row3_idx)
+
+    idx_all = set(range(len(arr_lst_mean)))
+    idx_rows = set(row1_idx).union(row2_idx).union(row3_idx)
+
+    if idx_rows != idx_all:
+        raise ValueError(
+            "row1_idx, row2_idx, and row3_idx must cover all panels exactly. "
+            f"len(arr_lst_mean)={len(arr_lst_mean)}, expected indices={sorted(idx_all)}, "
+            f"provided indices={sorted(idx_rows)}"
+        )
+
+    if (
+        set(row1_idx).intersection(row2_idx)
+        or set(row1_idx).intersection(row3_idx)
+        or set(row2_idx).intersection(row3_idx)
+    ):
+        raise ValueError("row1_idx, row2_idx, and row3_idx must not overlap.")
+
+    proj = ccrs.SouthPolarStereo()
+    cmap = plt.cm.jet if cmap is None else cmap
+
+    norm = PowerNorm(gamma=gamma, vmin=vmin, vmax=vmax)
+
+    if cbar_ticks is None:
+        cbar_ticks = [0, 25, 50, 100, 200, 300, 400]
+
+    nrows = 3
+    ncols = 5
+
+    if figsize is None:
+        figsize = (4.25 * ncols + 1.3, 4.25 * nrows)
+
+    fig, axes2d = plt.subplots(
+        nrows,
+        ncols,
+        subplot_kw={"projection": proj},
+        figsize=figsize,
+    )
+
+    fig.subplots_adjust(
+        left=0.035,
+        right=0.875,
+        top=0.96,
+        bottom=0.06,
+        wspace=0.12,
+        hspace=0.20,
+    )
+
+    axes2d = np.asarray(axes2d)
+
+    for ax in axes2d.ravel():
+        ax.set_visible(False)
+
+    layout_positions = {}
+
+    # Row 1 has 3 panels centered in columns 1, 2, 3.
+    row1_cols = [1, 2, 3]
+    for idx, col in zip(row1_idx, row1_cols):
+        layout_positions[idx] = (0, col)
+
+    # Rows 2 and 3 use all five columns.
+    for idx, col in zip(row2_idx, range(5)):
+        layout_positions[idx] = (1, col)
+
+    for idx, col in zip(row3_idx, range(5)):
+        layout_positions[idx] = (2, col)
+
+    letters = list("abcdefghijklmnopqrstuvwxyz")
+    axes_out = []
+
+    for i, (product_name, plot_grid, panel_mean) in enumerate(arr_lst_mean):
+        r, c = layout_positions[i]
+        ax = axes2d[r, c]
+        ax.set_visible(True)
+
+        panel_label = letters[i] if panel_letters and i < len(letters) else None
+
+        _plot_single_polar_basin_panel(
+            ax=ax,
+            product_name=product_name,
+            basin_plot_grid=plot_grid,
+            basin_mask_latlon=basin_mask_latlon,
+            panel_mean=panel_mean if show_panel_mean else np.nan,
+            proj=proj,
+            cmap=cmap,
+            norm=norm,
+            panel_label=panel_label,
+            mean_fmt=mean_fmt,
+            mean_xy=mean_xy,
+            mean_fontsize=mean_fontsize,
+        )
+
+        axes_out.append(ax)
+
+    # One shared colorbar for all panels.
+    cax = fig.add_axes([0.90, 0.16, 0.016, 0.68])
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+
+    cb = fig.colorbar(sm, cax=cax, orientation="vertical", extend="max")
+    cb.set_ticks(cbar_ticks)
+    cb.ax.tick_params(labelsize=15)
+    cb.ax.minorticks_off()
+    # cb.ax.set_title(r"mm yr$^{-1}$", fontsize=14, pad=12, fontweight="bold")
+    cb.set_label(cbar_label, fontsize=15, fontweight="bold")
+
+    return fig, axes_out, cb
+
+#===============================================================================
 # plot_regional_mean_annual_bars
 
 def plot_regional_mean_annual_bars(
     df_mean_regional,
     region_order=("Antarctica", "West Antarctica", "East Antarctica"),
-    product_order=(r"$P_{\mathrm{MB}}$", "ERA5", "GPCP v3.3"),
+    product_order=None,
     product_colors=None,
-    figsize=(8.5, 6.0),
+    figsize=None,
     ylabel="[mm/year]",
     title="2013–2020 mean annual precipitation",
     annotate=True,
-    bar_width=0.22,
+    max_total_group_width=0.82,
+    min_bar_width=0.10,
+    max_bar_width=0.22,
+    legend_ncol=None,
+    legend_loc="upper right",
+    ylim_pad_frac=0.14,
 ):
     """
-    Grouped bar chart of regional mean annual precipitation.
+    Adaptive grouped bar chart of regional mean annual precipitation.
+
+    Works better when more products are added because bar width, offsets,
+    figure size, annotation height, y-limit, and legend columns adapt to the
+    number of products.
     """
+
+    # -------------------------------------------------------------------------
+    # 1. Product order and color defaults
+    # -------------------------------------------------------------------------
+    if product_order is None:
+        product_order = list(df_mean_regional["product"].dropna().unique())
+
+    n_regions = len(region_order)
+    n_products = len(product_order)
+
     if product_colors is None:
         product_colors = {
             r"$P_{\mathrm{MB}}$": "black",
             "ERA5": "blue",
             "GPCP v3.3": "orange",
+            "GPCP V3.3": "orange",
+            "GPM PMW V07": "cyan",
+            "GPM PMW V08": "green",
         }
+
+    # -------------------------------------------------------------------------
+    # 2. Adaptive figure size
+    # -------------------------------------------------------------------------
+    if figsize is None:
+        fig_width = max(8.5, 2.4 * n_regions + 0.45 * n_products)
+        fig_height = 6.0
+        figsize = (fig_width, fig_height)
 
     fig, ax = plt.subplots(figsize=figsize)
 
-    x = np.arange(len(region_order))
+    # -------------------------------------------------------------------------
+    # 3. Adaptive bar width and offsets
+    # -------------------------------------------------------------------------
+    bar_width = max_total_group_width / max(n_products, 1)
+    bar_width = np.clip(bar_width, min_bar_width, max_bar_width)
+
+    total_width = bar_width * n_products
     offsets = np.linspace(
-        -bar_width * (len(product_order) - 1) / 2,
-         bar_width * (len(product_order) - 1) / 2,
-         len(product_order)
+        -total_width / 2 + bar_width / 2,
+         total_width / 2 - bar_width / 2,
+         n_products,
     )
 
+    x = np.arange(n_regions)
+
+    # -------------------------------------------------------------------------
+    # 4. Get y-axis range for annotation placement
+    # -------------------------------------------------------------------------
+    y_all = df_mean_regional.loc[
+        df_mean_regional["product"].isin(product_order),
+        "precipitation"
+    ].astype(float).values
+
+    y_max = np.nanmax(y_all)
+    label_offset = 0.018 * y_max
+
+    # -------------------------------------------------------------------------
+    # 5. Plot bars
+    # -------------------------------------------------------------------------
     for off, prod in zip(offsets, product_order):
+
         sub = (
             df_mean_regional[df_mean_regional["product"] == prod]
             .set_index("region")
@@ -3806,13 +5990,33 @@ def plot_regional_mean_annual_bars(
 
         y = sub["precipitation"].values.astype(float)
 
+        # product_colors can be either:
+        #   {"ERA5": "blue"}
+        # or:
+        #   {"ERA5": {"color": "blue", "edgecolor": "black"}}
+        style = product_colors.get(prod, None)
+
+        if isinstance(style, dict):
+            color = style.get("color", None)
+            edgecolor = style.get("edgecolor", "none")
+            hatch = style.get("hatch", None)
+            alpha = style.get("alpha", 1.0)
+        else:
+            color = style
+            edgecolor = "none"
+            hatch = None
+            alpha = 1.0
+
         bars = ax.bar(
             x + off,
             y,
             width=bar_width,
-            color=product_colors.get(prod, None)['color'],
+            color=color,
+            edgecolor=edgecolor,
+            hatch=hatch,
+            alpha=alpha,
             label=prod,
-            zorder=3
+            zorder=3,
         )
 
         if annotate:
@@ -3820,20 +6024,44 @@ def plot_regional_mean_annual_bars(
                 if np.isfinite(val):
                     ax.text(
                         b.get_x() + b.get_width() / 2,
-                        b.get_height() + 0.01 * np.nanmax(df_mean_regional["precipitation"]),
+                        b.get_height() + label_offset,
                         f"{int(round(val))}",
                         ha="center",
                         va="bottom",
-                        fontsize=10,
-                        fontweight="bold"
+                        fontsize=9 if n_products >= 5 else 10,
+                        fontweight="bold",
+                        rotation=0,
+                        clip_on=False,
                     )
 
+    # -------------------------------------------------------------------------
+    # 6. Axes formatting
+    # -------------------------------------------------------------------------
     ax.set_xticks(x)
-    ax.set_xticklabels(region_order, fontsize=15)
+    ax.set_xticklabels(["AIS", "WAIS", "EAIS"], fontsize=14, fontweight="bold")
+
     ax.set_ylabel(ylabel, fontsize=14, fontweight="bold")
-    # ax.set_title(title, fontsize=15, fontweight="bold")
+
+    if title is not None:
+        ax.set_title(title, fontsize=15, fontweight="bold")
+
     ax.grid(axis="y", linestyle="--", alpha=0.35, zorder=0)
-    ax.legend(frameon=False, fontsize=15)
+
+    ax.set_ylim(0, y_max * (1 + ylim_pad_frac))
+
+    # -------------------------------------------------------------------------
+    # 7. Adaptive legend
+    # -------------------------------------------------------------------------
+    if legend_ncol is None:
+        legend_ncol = 1 if n_products <= 5 else 2
+
+    ax.legend(
+        frameon=False,
+        fontsize=13 if n_products >= 5 else 15,
+        ncol=legend_ncol,
+        loc=legend_loc,
+    )
 
     plt.tight_layout()
+
     return fig, ax
